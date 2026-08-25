@@ -1,0 +1,91 @@
+services:
+  db:
+    image: postgres:16-alpine
+    container_name: job_scheduler_db
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-scheduler_user}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-scheduler_pass}
+      POSTGRES_DB: ${POSTGRES_DB:-job_scheduler}
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-scheduler_user} -d ${POSTGRES_DB:-job_scheduler}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  api:
+    build:
+      context: ./backend
+    container_name: job_scheduler_api
+    restart: unless-stopped
+    env_file:
+      - ./backend/.env
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./backend:/app
+    depends_on:
+      db:
+        condition: service_healthy
+    # Applies migrations, then starts the API. This keeps "one command
+    # to get a working system" true even on a fresh checkout.
+    command: >
+      sh -c "alembic upgrade head &&
+             uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload"
+
+  worker:
+    build:
+      context: ./backend
+    restart: unless-stopped
+    env_file:
+      - ./backend/.env
+    volumes:
+      - ./backend:/app
+    depends_on:
+      db:
+        condition: service_healthy
+      api:
+        condition: service_started
+    # Scale with: docker compose up --scale worker=3
+    # Multiple worker containers claim from the same job pool safely --
+    # that's the whole point of the atomic SKIP LOCKED claiming logic.
+    command: python -m app.workers.worker --concurrency 5
+
+  scheduler:
+    build:
+      context: ./backend
+    restart: unless-stopped
+    env_file:
+      - ./backend/.env
+    volumes:
+      - ./backend:/app
+    depends_on:
+      db:
+        condition: service_healthy
+      api:
+        condition: service_started
+    # Spawns Job instances from due cron templates. Safe to run more
+    # than one replica of (list_due uses SKIP LOCKED too), but one is
+    # enough for local development.
+    command: python -m app.scheduler.loop
+
+  frontend:
+    build:
+      context: ./frontend
+    restart: unless-stopped
+    environment:
+      VITE_API_BASE_URL: http://localhost:8000
+    ports:
+      - "5173:5173"
+    volumes:
+      - ./frontend:/app
+      - /app/node_modules
+    depends_on:
+      - api
+
+volumes:
+  pgdata:
